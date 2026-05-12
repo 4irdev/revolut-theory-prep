@@ -23,7 +23,7 @@ Transaction T2 reads data modified by T1 that hasn't been committed yet. If T1 r
 
 A transaction reads the same row twice and gets different results because another transaction modified and committed that row in between.
 
-> T1 reads price = 500 → T2 updates price to 600 and commits → T1 reads price = 600
+> T1 reads price = 500 → T2 updates price to 600 and commits → T-1 reads price = 600
 
 ### Phantom Read
 
@@ -31,16 +31,18 @@ A transaction runs the same query twice and gets different row sets because anot
 
 > T1 queries orders > 1000, gets 5 rows → T2 inserts a qualifying order → T1 re-queries, gets 6 rows
 
+[Article Source](https://dev.to/abhivyaktii/understanding-read-phenomena-in-databases-50mk)
+
 ---
 
 ## Isolation Levels
 
-| Level | Dirty Read | Non-Repeatable Read | Phantom Read |
-| --- | --- | --- | --- |
-| Read Uncommitted | Possible | Possible | Possible |
-| Read Committed | Prevented | Possible | Possible |
-| Repeatable Read | Prevented | Prevented | Possible |
-| Serializable | Prevented | Prevented | Prevented |
+| Level            | Dirty Read | Non-Repeatable Read | Phantom Read |
+| ---------------- | ---------- | ------------------- | ------------ |
+| Read Uncommitted | Possible   | Possible            | Possible     |
+| Read Committed   | Prevented  | Possible            | Possible     |
+| Repeatable Read  | Prevented  | Prevented           | Possible     |
+| Serializable     | Prevented  | Prevented           | Prevented    |
 
 ### When to use each level
 
@@ -63,6 +65,21 @@ Key concepts:
 - **Covering index** — contains all columns needed by the query, so DB doesn't need to read the row at all.
 - **When indexes are not used**: function on the column (`WHERE LOWER(email) = ...`), leading wildcard (`LIKE '%foo'`), implicit type cast, very small tables.
 - **Cost**: every `INSERT`/`UPDATE`/`DELETE` must update all indexes on the table → over-indexing kills write performance.
+
+Index types by underlying data structure:
+
+- **B-Tree / B+ Tree** — balanced tree, sorted. Default for almost everything. Best for: equality (`=`, `IN`), ranges (`<`, `>`, `BETWEEN`), prefix `LIKE 'foo%'`, `ORDER BY`. The safe default — pick this unless you have a reason not to.
+- **Hash** — hash table, O(1) lookup. Best for: pure equality on high-cardinality columns (sessions, cache keys). No range queries, no sorting. In Postgres rarely beats B-tree in practice.
+- **GIN (Generalized Inverted Index)** — inverted index: maps each element → list of rows containing it. Best for: full-text search (`tsvector`), `jsonb` containment (`@>`), arrays, trigram `LIKE '%foo%'`. Slow writes, fast reads.
+- **GiST (Generalized Search Tree)** — extensible tree for "nearest" / overlap queries. Best for: geometry (PostGIS), ranges, k-NN ("find 10 closest points"), exclusion constraints (no overlapping bookings).
+- **SP-GiST** — space-partitioned GiST (quad-trees, radix trees). Best for: non-balanced data like IP addresses, phone numbers, hierarchies where keys cluster unevenly.
+- **BRIN (Block Range Index)** — stores min/max per block range, tiny on disk. Best for: huge append-only tables where data is naturally ordered (timestamps in logs, event tables). Rough but cheap; bad if data is shuffled.
+- **Bitmap** — bit per row per value (Oracle/DWH; Postgres builds them on the fly). Best for: low-cardinality columns (gender, status) and combining many filters with AND/OR in analytics. Bad for OLTP — row-level locks become table-level.
+- **R-Tree** — bounding-box tree for spatial data. Best for: 2D/3D geometry, "find all shapes intersecting this rectangle". In Postgres exposed via GiST.
+- **Full-text index** — tokenized + normalized text (stemming, stop-words). Best for: search engines over articles/comments. In Postgres = GIN over `tsvector`; MySQL has native `FULLTEXT`.
+- **Partial index** — B-tree built only over rows matching a `WHERE`. Best for: skewed data ("only active users", "only unprocessed rows"). Smaller and faster than a full index.
+- **Expression / Functional index** — index on `f(column)` instead of the column. Best for: case-insensitive search (`LOWER(email)`), `date_trunc('day', created_at)`, computed values.
+- **Unique index** — B-tree that rejects duplicates. Best for: enforcing uniqueness (emails, slugs); also speeds up lookups by that key.
 
 Read `EXPLAIN` / `EXPLAIN ANALYZE` to verify the index is actually used.
 
@@ -109,14 +126,14 @@ How to detect: enable SQL logging in dev, count queries per request, use APM too
 
 ## JOINs
 
-| Type | Returns |
-| --- | --- |
-| `INNER JOIN` | Only rows matching in both tables |
-| `LEFT JOIN` | All rows from left + matched from right (NULLs for unmatched) |
-| `RIGHT JOIN` | All rows from right + matched from left |
-| `FULL OUTER JOIN` | All rows from both, NULLs where no match |
-| `CROSS JOIN` | Cartesian product (every left row × every right row) |
-| `SELF JOIN` | Table joined with itself (e.g. employee → manager) |
+| Type                | Returns                                                       |
+| ------------------- | ------------------------------------------------------------- |
+| `INNER JOIN`      | Only rows matching in both tables                             |
+| `LEFT JOIN`       | All rows from left + matched from right (NULLs for unmatched) |
+| `RIGHT JOIN`      | All rows from right + matched from left                       |
+| `FULL OUTER JOIN` | All rows from both, NULLs where no match                      |
+| `CROSS JOIN`      | Cartesian product (every left row × every right row)         |
+| `SELF JOIN`       | Table joined with itself (e.g. employee → manager)           |
 
 **The most common production bug**: `LEFT JOIN` becomes effectively `INNER JOIN` when you put a condition on the right table in `WHERE`:
 
@@ -170,12 +187,15 @@ The hardest decisions:
 
 ## Locking & Deadlocks
 
-Locks coordinate concurrent transactions. Granularity: **row-level** (most common, cheapest concurrency) → **page** → **table**.
+Locks coordinate concurrent transactions. 
+
+Granularity: **row-level** (most common, cheapest concurrency) → **page** → **table**.
 
 Lock modes (simplified):
 
 - **Shared (S)** — for reads. Multiple readers OK, blocks writers.
 - **Exclusive (X)** — for writes. Blocks everything.
+- **Update (U)** - for updates to avoid deadlocks, convert to X when ready to write
 
 **Deadlock** = two transactions each hold a lock the other needs. Coffman conditions (all four required):
 
@@ -212,9 +232,10 @@ COMMIT;
 ```sql
 -- read
 SELECT balance, version FROM accounts WHERE id = 42;
+-- Returns: id=42, stock=5, version=3
 -- write
 UPDATE accounts SET balance = ?, version = version + 1
-WHERE id = 42 AND version = ?;  -- 0 rows affected → retry
+WHERE id = 42 AND version = 3;  -- 0 rows affected → retry
 ```
 
 Use **pessimistic** when conflicts are frequent and retry is expensive (e.g. inventory decrement under heavy contention). Use **optimistic** for everything else — most CRUD apps.
@@ -230,8 +251,8 @@ Rule: **prefer DB-level locking** when the data lives in a DB. Reach for distrib
 **Articles:**
 
 - [Locks and Deadlocks in SQL Server: Understand, Detect, and Prevent — Medium](https://rafaelrampineli.medium.com/locks-and-deadlocks-in-sql-server-understand-detect-and-prevent-0b74fbb09bd2)
-- [A Beginner's Guide to Database Deadlock — Vlad Mihalcea](https://vladmihalcea.com/database-deadlock/)
-- [Optimistic vs Pessimistic Locking: What Nobody Tells You Until You've Burnt in Production — Medium](https://medium.com/@liberatoreanita/optimistic-vs-pessimistic-locking-what-nobody-tells-you-until-youve-burnt-in-production-c12f972ec90d)
+- [A Beginner&#39;s Guide to Database Deadlock — Vlad Mihalcea](https://vladmihalcea.com/database-deadlock/)
+- [Optimistic vs Pessimistic Locking: What Nobody Tells You Until You&#39;ve Burnt in Production — Medium](https://medium.com/@liberatoreanita/optimistic-vs-pessimistic-locking-what-nobody-tells-you-until-youve-burnt-in-production-c12f972ec90d)
 - [How to do distributed locking — Martin Kleppmann](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
 
 ---
@@ -259,7 +280,7 @@ Replication ≠ sharding — they are orthogonal and often combined (each shard 
 **Articles:**
 
 - [Master-Slave Architecture (Leader-Based Replication) — Medium](https://codexbook.medium.com/master-slave-architecture-leader-based-replication-79b7095443ec)
-- [Database Replication & Sharding Explained — Substack](https://hayksimonyan.substack.com/p/database-replication-and-sharding)
+- [Database Replication &amp; Sharding Explained — Substack](https://hayksimonyan.substack.com/p/database-replication-and-sharding)
 - [Designing Data-Intensive Applications, Ch. 5 (notes)](https://notes.shichao.io/dda/ch5/)
 
 ---
@@ -331,13 +352,13 @@ This matters more in practice — most of the time there's no partition, and you
 
 Real systems:
 
-| System | CAP | PACELC |
-| --- | --- | --- |
-| Postgres (single node) | CA-ish (no partition) | — |
-| MongoDB | CP | PC/EC |
-| Cassandra | AP | PA/EL |
-| DynamoDB | AP (tunable) | PA/EL |
-| Spanner | CP | PC/EC |
+| System                 | CAP                   | PACELC |
+| ---------------------- | --------------------- | ------ |
+| Postgres (single node) | CA-ish (no partition) | —     |
+| MongoDB                | CP                    | PC/EC  |
+| Cassandra              | AP                    | PA/EL  |
+| DynamoDB               | AP (tunable)          | PA/EL  |
+| Spanner                | CP                    | PC/EC  |
 
 Consistency models (weakest → strongest):
 
@@ -360,12 +381,12 @@ SQL — relational, schema-on-write, ACID, rich querying via JOINs. Use when rel
 
 NoSQL — umbrella for non-relational stores. Four main types:
 
-| Type | Examples | Best for |
-| --- | --- | --- |
-| Document | MongoDB, Couchbase | Flexible schemas, JSON-shaped data, content/catalog |
-| Key-Value | Redis, DynamoDB | Caches, sessions, leaderboards, fast lookups |
-| Column-family | Cassandra, ScyllaDB, HBase | Write-heavy, time-series, wide rows |
-| Graph | Neo4j, Neptune | Relationship-heavy queries (social, fraud, recommendation) |
+| Type          | Examples                   | Best for                                                   |
+| ------------- | -------------------------- | ---------------------------------------------------------- |
+| Document      | MongoDB, Couchbase         | Flexible schemas, JSON-shaped data, content/catalog        |
+| Key-Value     | Redis, DynamoDB            | Caches, sessions, leaderboards, fast lookups               |
+| Column-family | Cassandra, ScyllaDB, HBase | Write-heavy, time-series, wide rows                        |
+| Graph         | Neo4j, Neptune             | Relationship-heavy queries (social, fraud, recommendation) |
 
 When to pick NoSQL:
 
@@ -384,7 +405,7 @@ Modern Postgres covers a lot of NoSQL use cases (JSONB, vectors via pgvector, fu
 **Articles:**
 
 - [Intro to 4 Types of NoSQL Databases — dev.to](https://dev.to/aws-builders/intro-to-4-types-of-nosql-databases-45nh)
-- [NoSQL Isn't One-Size-Fits-All: When to Use Document, Key-Value, Column or Graph](https://exabyting.com/blog/nosql-isnt-one-size-fits-all-when-to-use-document-key-value-column-or-graph/)
+- [NoSQL Isn&#39;t One-Size-Fits-All: When to Use Document, Key-Value, Column or Graph](https://exabyting.com/blog/nosql-isnt-one-size-fits-all-when-to-use-document-key-value-column-or-graph/)
 
 ---
 
@@ -403,12 +424,12 @@ Typical mistake: setting pool size huge "just in case". Postgres handles ~100–
 
 ### Caching strategies
 
-| Strategy | Read flow | Write flow | Notes |
-| --- | --- | --- | --- |
-| **Cache-aside** (lazy) | App: check cache → miss → load DB → put in cache | App writes DB, invalidates cache | Most common; cache only what's read |
-| **Read-through** | App asks cache; cache loads from DB on miss | — | Cache layer handles loading |
-| **Write-through** | Same as read-through | App writes cache → cache writes DB | Strong consistency, slower writes |
-| **Write-behind** (write-back) | — | App writes cache; cache async flushes to DB | Fast writes, risk of data loss |
+| Strategy                            | Read flow                                           | Write flow                                  | Notes                               |
+| ----------------------------------- | --------------------------------------------------- | ------------------------------------------- | ----------------------------------- |
+| **Cache-aside** (lazy)        | App: check cache → miss → load DB → put in cache | App writes DB, invalidates cache            | Most common; cache only what's read |
+| **Read-through**              | App asks cache; cache loads from DB on miss         | —                                          | Cache layer handles loading         |
+| **Write-through**             | Same as read-through                                | App writes cache → cache writes DB         | Strong consistency, slower writes   |
+| **Write-behind** (write-back) | —                                                  | App writes cache; cache async flushes to DB | Fast writes, risk of data loss      |
 
 **Cache stampede / thundering herd**: a popular key expires; thousands of concurrent requests miss simultaneously and all hit the DB. Mitigations: lock on miss (single-flight), probabilistic early refresh, jittered TTLs.
 
@@ -456,7 +477,7 @@ Aggregates:
 **Articles:**
 
 - [Understanding NULL and Three-valued Logic in SQL — Medium](https://medium.com/@seop7566/understanding-null-and-three-valued-logic-in-sql-8aa9dd574fbc)
-- [Understanding SQL's Three-Valued Logic (3VL) — Medium](https://medium.com/@pramodteepireddy/understanding-sqls-three-valued-logic-3vl-true-false-and-null-75b6dc5945aa)
+- [Understanding SQL&#39;s Three-Valued Logic (3VL) — Medium](https://medium.com/@pramodteepireddy/understanding-sqls-three-valued-logic-3vl-true-false-and-null-75b6dc5945aa)
 - [Modern SQL: Three-Valued Logic — modern-sql.com](https://modern-sql.com/concept/three-valued-logic)
 
 ---
@@ -487,8 +508,8 @@ Rule of thumb: start with partitioning when a single table grows past tens of mi
 
 **Articles:**
 
-- [Sharding vs. partitioning: What's the difference? — PlanetScale](https://planetscale.com/blog/sharding-vs-partitioning-whats-the-difference)
-- [Partitioning & Sharding — choosing the right scaling method — Medium](https://medium.com/@_amanarora/partitioning-sharding-choosing-the-right-scaling-method-dbc6b2bec1d5)
+- [Sharding vs. partitioning: What&#39;s the difference? — PlanetScale](https://planetscale.com/blog/sharding-vs-partitioning-whats-the-difference)
+- [Partitioning &amp; Sharding — choosing the right scaling method — Medium](https://medium.com/@_amanarora/partitioning-sharding-choosing-the-right-scaling-method-dbc6b2bec1d5)
 - [Sharding vs Partitioning — DataCamp](https://www.datacamp.com/blog/sharding-vs-partitioning)
 
 ---
